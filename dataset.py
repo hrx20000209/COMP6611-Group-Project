@@ -4,19 +4,22 @@ import torch
 from torch.utils.data import Dataset
 import random
 
-
 class MultiModalActionDataset(Dataset):
-    def __init__(self, sample_list, label_map, radar_max_points=32, transform=None):
+    def __init__(self, sample_list, label_map, radar_max_points=32, target_len=15, transform=None, radar_augment=False):
         """
         sample_list: list of (npz_path, label_name)
         label_map: dict {label_name: label_index}
         radar_max_points: 最大保留雷达点数（不足补零）
-        transform: 对视频帧的transform（如resize）
+        target_len: 补齐或截断到固定帧数，比如15帧
+        transform: torchvision transform，用于视频数据
+        radar_augment: 是否对雷达数据做增强（只在训练集打开）
         """
         self.samples = sample_list
         self.label_map = label_map
         self.radar_max_points = radar_max_points
+        self.target_len = target_len
         self.transform = transform
+        self.radar_augment = radar_augment
 
     def __len__(self):
         return len(self.samples)
@@ -25,12 +28,10 @@ class MultiModalActionDataset(Dataset):
         npz_path, label_name = self.samples[idx]
         data = np.load(npz_path, allow_pickle=True)
 
-        # 处理雷达数据
-        radar_sequence = data['radar']  # (T, N, 5)
-        radar_tensor = self._process_radar(radar_sequence)
+        radar_sequence = data['radar']  # List of dicts
+        video_sequence = data['video']  # List of dicts
 
-        # 处理视频数据
-        video_sequence = data['video']  # (T, H, W, C)
+        radar_tensor = self._process_radar(radar_sequence)
         video_tensor = self._process_video(video_sequence)
 
         label = self.label_map[label_name]
@@ -38,40 +39,78 @@ class MultiModalActionDataset(Dataset):
         return radar_tensor, video_tensor, label
 
     def _process_radar(self, radar_sequence):
-        """
-        radar_sequence: (T, N, 5)
-        保留每帧前 radar_max_points 个点，不足补零
-        """
         frames = []
         for frame in radar_sequence:
-            if frame.shape[0] >= self.radar_max_points:
-                selected = frame[:self.radar_max_points, :]
+            x = np.array(frame['x'])
+            y = np.array(frame['y'])
+            z = np.array(frame['z'])
+            doppler = np.array(frame['doppler'])
+            range_ = np.array(frame['range'])
+
+            points = np.stack([x, y, z, doppler, range_], axis=-1)
+
+            if self.radar_augment:
+                points = self._augment_radar(points)
+
+            # 简单归一化
+            points[:, :3] /= 128.0  # x,y,z
+            points[:, 3] /= 8208.0  # doppler
+            points[:, 4] /= 5.0     # range
+
+            if points.shape[0] >= self.radar_max_points:
+                selected = points[:self.radar_max_points, :]
             else:
-                pad = np.zeros((self.radar_max_points - frame.shape[0], 5))
-                selected = np.vstack((frame, pad))
+                pad = np.zeros((self.radar_max_points - points.shape[0], 5))
+                selected = np.vstack((points, pad))
+
             frames.append(selected)
 
-        frames = np.stack(frames)  # (T, radar_max_points, 5)
+        frames = self._pad_or_truncate(frames, self.target_len)
+        frames = np.stack(frames)
         return torch.from_numpy(frames).float()
 
+    def _augment_radar(self, points):
+        # 随机丢点
+        keep_ratio = np.random.uniform(0.8, 1.0)
+        num_keep = int(points.shape[0] * keep_ratio)
+        indices = np.random.choice(points.shape[0], num_keep, replace=False)
+        points = points[indices]
+
+        # 小尺度噪声
+        noise = np.random.normal(0, 0.01, size=points.shape)
+        points += noise
+
+        return points
+
     def _process_video(self, video_sequence):
-        """
-        video_sequence: (T, H, W, C)
-        """
         frames = []
         for frame in video_sequence:
-            if self.transform:
-                frame = self.transform(frame)
-            else:
-                frame = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-            frames.append(frame)
+            img = frame['frame']
+            img = img[..., [2, 1, 0]]  # BGR -> RGB
 
-        frames = torch.stack(frames)  # (T, C, H, W)
+            img = img.astype(np.uint8)
+
+            if self.transform:
+                img = self.transform(img)
+            else:
+                img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+            frames.append(img)
+
+        frames = self._pad_or_truncate(frames, self.target_len)
+        frames = torch.stack(frames)
         return frames
 
+    def _pad_or_truncate(self, frames, target_len):
+        if len(frames) >= target_len:
+            frames = frames[:target_len]
+        else:
+            pad = [frames[-1]] * (target_len - len(frames))
+            frames = frames + pad
+        return frames
 
-def build_dataset(root_dir, train_ratio=0.8, radar_max_points=32, transform=None):
-    label_names = sorted(os.listdir(root_dir))  # 例如 ['sitting', 'squatting', 'standing', 'walking']
+def build_dataset(root_dir, train_ratio=0.8, radar_max_points=32, target_len=15, train_transform=None, val_transform=None):
+    label_names = sorted(os.listdir(root_dir))
     label_map = {name: idx for idx, name in enumerate(label_names)}
 
     samples = []
@@ -82,13 +121,25 @@ def build_dataset(root_dir, train_ratio=0.8, radar_max_points=32, transform=None
                 file_path = os.path.join(label_dir, file_name)
                 samples.append((file_path, label_name))
 
-    # 打乱并划分
     random.shuffle(samples)
     split_idx = int(len(samples) * train_ratio)
     train_samples = samples[:split_idx]
     val_samples = samples[split_idx:]
 
-    train_set = MultiModalActionDataset(train_samples, label_map, radar_max_points, transform)
-    val_set = MultiModalActionDataset(val_samples, label_map, radar_max_points, transform)
+    train_set = MultiModalActionDataset(
+        train_samples, label_map,
+        radar_max_points=radar_max_points,
+        target_len=target_len,
+        transform=train_transform,
+        radar_augment=True
+    )
+
+    val_set = MultiModalActionDataset(
+        val_samples, label_map,
+        radar_max_points=radar_max_points,
+        target_len=target_len,
+        transform=val_transform,
+        radar_augment=False
+    )
 
     return train_set, val_set, label_map
