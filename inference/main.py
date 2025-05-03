@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 from model import MultiModalActionModel  # Import your trained model
 
 # Assuming the model has been trained and saved previously
-model = MultiModalActionModel(num_classes=10)  # Update num_classes as per your model
+model = MultiModalActionModel(num_classes=4)  # Update num_classes as per your model
 checkpoint = torch.load("best_model.pth")  # Load your saved model checkpoint
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()  # Set the model to evaluation mode
